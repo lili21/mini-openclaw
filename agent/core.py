@@ -11,7 +11,7 @@ class Agent:
         self.model = model
         self.max_iterations = 10
 
-    async def run(self, platform: str, user_id: str, user_message: str) -> str:
+    def run(self, platform: str, user_id: str, user_message: str) -> str:
         messages = load_session(platform, user_id)
         full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
 

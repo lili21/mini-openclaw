@@ -4,7 +4,7 @@ class BaseAdapter(ABC):
     platform_name: str
 
     @abstractmethod
-    async def start(self):
+    def start(self):
         """启动适配器"""
         pass
 

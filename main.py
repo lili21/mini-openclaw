@@ -1,5 +1,4 @@
 import os
-import asyncio
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -15,14 +14,10 @@ client = OpenAI(
 
 agent = Agent(client)
 
-async def main():
-    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    
-    if telegram_token:
-        adapter = TelegramAdapter(telegram_token, agent)
-        await adapter.start()
-    else:
-        print("No adapter configured. Set TELEGRAM_BOT_TOKEN in .env")
+telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+if telegram_token:
+    adapter = TelegramAdapter(telegram_token, agent)
+    adapter.start()
+else:
+    print("No adapter configured. Set TELEGRAM_BOT_TOKEN in .env")
