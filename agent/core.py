@@ -2,7 +2,7 @@ import json
 import logging
 from openai import OpenAI
 
-from agent.prompt import SYSTEM_PROMPT
+from agent.prompt import get_system_prompt
 from agent.tools import TOOLS_SCHEMA, TOOL_FUNCTIONS
 from storage.session import load_session, append_to_session, compress_session
 
@@ -20,7 +20,7 @@ class Agent:
             f"[Agent] start run - platform={platform}, user_id={user_id}, message={user_message[:50]}..."
         )
         messages = load_session(platform, user_id)
-        full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+        full_messages = [{"role": "system", "content": get_system_prompt()}] + messages
 
         user_msg = {"role": "user", "content": user_message}
         full_messages.append(user_msg)

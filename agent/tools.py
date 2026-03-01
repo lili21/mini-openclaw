@@ -126,6 +126,20 @@ def search_memory(query: str) -> str:
         return f"搜索失败: {str(e)}"
 
 
+def load_skill(name: str) -> str:
+    try:
+        from agent.skills.loader import get_skill
+
+        skill = get_skill(name)
+        if not skill:
+            return f"技能不存在: {name}"
+        if not skill.content:
+            return f"无法加载技能内容: {name}"
+        return f"# {skill.name}\n\n{skill.content}"
+    except Exception as e:
+        return f"加载技能失败: {str(e)}"
+
+
 TOOL_FUNCTIONS: dict[str, Callable[..., str]] = {
     "run_command": run_command,
     "read_file": read_file,
@@ -133,6 +147,7 @@ TOOL_FUNCTIONS: dict[str, Callable[..., str]] = {
     "web_search": web_search,
     "save_memory": save_memory,
     "search_memory": search_memory,
+    "load_skill": load_skill,
 }
 
 TOOLS_SCHEMA = [
@@ -217,6 +232,23 @@ TOOLS_SCHEMA = [
                     "query": {"type": "string", "description": "搜索关键词"}
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "load_skill",
+            "description": "加载技能指令，当需要使用某个技能时先调用此工具获取技能的详细指令",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "技能名称（如 news, weekly）",
+                    }
+                },
+                "required": ["name"],
             },
         },
     },
