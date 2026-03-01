@@ -51,10 +51,16 @@ async def handle_message(update: Update, context):
     # Load existing conversation
     messages = load_session(user_id)
 
+    # Build full message list with system prompt
+    full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+
+    # Add new user message
+    user_msg = {"role": "user", "content": user_message}
+    messages.append(user_msg)
+
     response = client.chat.completions.create(
         model="qwen3.5-plus",
-        messages=messages,
-        system=SYSTEM_PROMPT
+        messages=full_messages
     )
 
     # Save assistant response
