@@ -63,11 +63,42 @@ def write_file(path: str, content: str) -> str:
 def web_search(query: str) -> str:
     return "暂未实现"
 
+MEMORY_DIR = os.path.expanduser("~/.mini-openclaw/memory")
+os.makedirs(MEMORY_DIR, exist_ok=True)
+
+def save_memory(key: str, content: str) -> str:
+    safe_key = re.sub(r'[^\w\-_.]', '_', key)
+    path = os.path.join(MEMORY_DIR, f"{safe_key}.md")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return f"记忆已保存: {key}"
+    except Exception as e:
+        return f"保存失败: {str(e)}"
+
+def search_memory(query: str) -> str:
+    try:
+        results = []
+        for filename in os.listdir(MEMORY_DIR):
+            if filename.endswith(".md"):
+                path = os.path.join(MEMORY_DIR, filename)
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    if query.lower() in content.lower():
+                        results.append(f"## {filename[:-3]}\n{content[:500]}")
+        if results:
+            return "\n\n".join(results)
+        return "未找到相关记忆"
+    except Exception as e:
+        return f"搜索失败: {str(e)}"
+
 TOOL_FUNCTIONS: dict[str, Callable[..., str]] = {
     "run_command": run_command,
     "read_file": read_file,
     "write_file": write_file,
     "web_search": web_search,
+    "save_memory": save_memory,
+    "search_memory": search_memory,
 }
 
 TOOLS_SCHEMA = [
@@ -119,6 +150,35 @@ TOOLS_SCHEMA = [
         "function": {
             "name": "web_search",
             "description": "搜索网页内容",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_memory",
+            "description": "保存重要信息到长期记忆（如用户偏好、关键事实、项目详情）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "记忆的标识符/标题"},
+                    "content": {"type": "string", "description": "要保存的具体内容"}
+                },
+                "required": ["key", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_memory",
+            "description": "从长期记忆中搜索相关内容，用于回忆之前会话的上下文",
             "parameters": {
                 "type": "object",
                 "properties": {
