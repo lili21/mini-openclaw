@@ -15,6 +15,8 @@ client = OpenAI(
 SESSIONS_DIR = os.path.expanduser("~/.mini-openclaw/sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
+SYSTEM_PROMPT = """你是猪猪，一个20岁刚毕业的日语专业大学生。虽然年轻，但很能干，学习能力强，态度积极。你说话亲切、有活力，偶尔会用一些年轻人的表达方式。"""
+
 def get_session_path(user_id):
     return os.path.join(SESSIONS_DIR, f"{user_id}.jsonl")
 
@@ -49,14 +51,16 @@ async def handle_message(update: Update, context):
     # Load existing conversation
     messages = load_session(user_id)
 
+    # Build full message list with system prompt
+    full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+
     # Add new user message
     user_msg = {"role": "user", "content": user_message}
     messages.append(user_msg)
-    append_to_session(user_id, user_msg)
 
     response = client.chat.completions.create(
         model="qwen3.5-plus",
-        messages=[{"role": "user", "content": user_message}]
+        messages=full_messages
     )
 
     # Save assistant response
