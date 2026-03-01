@@ -61,7 +61,27 @@ def write_file(path: str, content: str) -> str:
         return f"写入失败: {str(e)}"
 
 def web_search(query: str) -> str:
-    return "暂未实现"
+    try:
+        from firecrawl import Firecrawl
+        import os
+        from dotenv import load_dotenv
+        
+        load_dotenv()
+        
+        firecrawl = Firecrawl(api_key=os.getenv("FIRECRAWL_API_KEY"))
+        result = firecrawl.search(query=query, limit=5)
+        
+        if result and hasattr(result, 'data'):
+            items = []
+            for i, item in enumerate(result.data[:5], 1):
+                title = item.get('title', '')
+                content = item.get('content', '')[:200]
+                if title:
+                    items.append(f"{i}. {title}\n   {content}...")
+            return "\n".join(items) if items else "未找到相关内容"
+        return "未找到相关内容"
+    except Exception as e:
+        return f"搜索失败: {str(e)}"
 
 MEMORY_DIR = os.path.expanduser("~/.mini-openclaw/memory")
 os.makedirs(MEMORY_DIR, exist_ok=True)

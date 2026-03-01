@@ -2,6 +2,7 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, filters
 
 from adapters.base import BaseAdapter
+from config import get_owner_chat_id, save_owner_chat_id
 
 class TelegramAdapter(BaseAdapter):
     platform_name = "telegram"
@@ -20,7 +21,15 @@ class TelegramAdapter(BaseAdapter):
         if self.app:
             await self.app.bot.send_message(chat_id=int(chat_id), text=text)
 
+    async def send_to_owner(self, text: str):
+        chat_id = get_owner_chat_id()
+        if chat_id:
+            await self.send_message(chat_id, text)
+
     async def handle_message(self, user_id: str, text: str) -> str:
+        if get_owner_chat_id() is None:
+            save_owner_chat_id(user_id)
+        
         return self.agent.run(self.platform_name, user_id, text)
 
     async def _handle_update(self, update: Update, context):
@@ -29,6 +38,9 @@ class TelegramAdapter(BaseAdapter):
         
         user_id = str(update.effective_user.id)
         user_message = update.message.text
+
+        if get_owner_chat_id() is None:
+            save_owner_chat_id(user_id)
 
         response = await self.handle_message(user_id, user_message)
         await update.message.reply_text(response)
