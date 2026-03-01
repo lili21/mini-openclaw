@@ -3,7 +3,7 @@ from openai import OpenAI
 
 from agent.prompt import SYSTEM_PROMPT
 from agent.tools import TOOLS_SCHEMA, TOOL_FUNCTIONS
-from storage.session import load_session, append_to_session
+from storage.session import load_session, append_to_session, compress_session
 
 class Agent:
     def __init__(self, client: OpenAI, model: str = "qwen3.5-plus"):
@@ -49,6 +49,8 @@ class Agent:
                 for msg in full_messages:
                     if msg.get("role") in ["user", "assistant"]:
                         append_to_session(platform, user_id, msg)
+
+                compress_session(platform, user_id, self.client, self.model)
 
                 return assistant_content
 
