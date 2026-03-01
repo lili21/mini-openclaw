@@ -12,7 +12,7 @@ client = OpenAI(
     base_url=os.getenv("BASE_URL")
 )
 
-SESSIONS_DIR = os.path.expanduser("~/.mini-openclaw")
+SESSIONS_DIR = os.path.expanduser("~/.mini-openclaw/sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 def get_session_path(user_id):
