@@ -1,5 +1,7 @@
 import os
 import json
+from datetime import datetime
+from typing import Optional
 
 SESSIONS_DIR = os.path.expanduser("~/.mini-openclaw/sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
@@ -78,3 +80,30 @@ def compress_session(platform: str, user_id: str, client, model: str):
     save_session(platform, user_id, [
         {"role": "assistant", "content": new_summary}
     ] + recent_msgs)
+
+def archive_session(platform: str, user_id: str) -> Optional[str]:
+    current_path = get_session_path(platform, user_id)
+    if not os.path.exists(current_path):
+        return None
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_path = os.path.join(SESSIONS_DIR, f"{platform}_{user_id}_{timestamp}.jsonl")
+    os.rename(current_path, archive_path)
+    return archive_path
+
+def list_sessions(platform: str, user_id: str) -> list[dict]:
+    prefix = f"{platform}_{user_id}_"
+    sessions = []
+    
+    if os.path.exists(SESSIONS_DIR):
+        for filename in os.listdir(SESSIONS_DIR):
+            if filename.startswith(prefix) and filename.endswith(".jsonl"):
+                filepath = os.path.join(SESSIONS_DIR, filename)
+                mtime = os.path.getmtime(filepath)
+                sessions.append({
+                    "filename": filename,
+                    "created": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+                })
+    
+    sessions.sort(key=lambda x: x["created"], reverse=True)
+    return sessions
