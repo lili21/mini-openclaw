@@ -35,14 +35,14 @@ def append_to_session(user_id, message):
     """Append a single message to the session file."""
     path = get_session_path(user_id)
     with open(path, "a") as f:
-        f.write(json.dumps(message) + "\n")
+        f.write(json.dumps(message, ensure_ascii=False) + "\n")
 
 def save_session(user_id, messages):
     """Overwrite the session file with the full message list."""
     path = get_session_path(user_id)
     with open(path, "w") as f:
         for message in messages:
-            f.write(json.dumps(message) + "\n")
+            f.write(json.dumps(message, ensure_ascii=False) + "\n")
 
 async def handle_message(update: Update, context):
     user_id = str(update.effective_user.id)
