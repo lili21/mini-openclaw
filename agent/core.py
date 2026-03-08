@@ -59,12 +59,14 @@ class Agent:
             else:
                 assistant_content = message.content
                 logger.info(f"[Agent] final response: {assistant_content[:100]}...")
-                full_messages.append(
-                    {"role": "assistant", "content": assistant_content}
-                )
 
-                for msg in full_messages:
-                    append_to_session(platform, user_id, msg)
+                # 只保存当前对话轮次的新消息（user 和 assistant），不保存历史消息
+                append_to_session(platform, user_id, user_msg)
+                append_to_session(
+                    platform,
+                    user_id,
+                    {"role": "assistant", "content": assistant_content},
+                )
 
                 compress_session(platform, user_id, self.client, self.model)
                 logger.info(
