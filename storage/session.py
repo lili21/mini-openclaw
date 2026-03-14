@@ -1,3 +1,4 @@
+import asyncio
 import os
 import json
 from datetime import datetime
@@ -42,7 +43,7 @@ def save_session(platform: str, user_id: str, messages: list[dict]):
             f.write(json.dumps(message, ensure_ascii=False) + "\n")
 
 
-def compress_session(platform: str, user_id: str, client, model: str):
+async def compress_session(platform: str, user_id: str, client, model: str):
     messages = load_session(platform, user_id)
 
     if count_chars(messages) < COMPRESSION_THRESHOLD:
@@ -74,7 +75,7 @@ def compress_session(platform: str, user_id: str, client, model: str):
 
 请输出更新后的摘要，格式：【Summary】+ 摘要内容。"""
 
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model=model, messages=[{"role": "user", "content": prompt}]
     )
 
@@ -82,8 +83,11 @@ def compress_session(platform: str, user_id: str, client, model: str):
     if not new_summary.startswith("【Summary】"):
         new_summary = "【Summary】" + new_summary
 
-    save_session(
-        platform, user_id, [{"role": "assistant", "content": new_summary}] + recent_msgs
+    await asyncio.to_thread(
+        save_session,
+        platform,
+        user_id,
+        [{"role": "assistant", "content": new_summary}] + recent_msgs,
     )
 
 
