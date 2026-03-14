@@ -21,7 +21,7 @@ PROJECT_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 SKILLS_DIR = os.path.join(PROJECT_ROOT, "skills")
-GLOBAL_SKILLS_DIR = os.path.expanduser("~/.agent/skills")
+GLOBAL_SKILLS_DIR = os.path.expanduser("~/.agents/skills")
 
 
 def parse_frontmatter(content: str) -> dict:

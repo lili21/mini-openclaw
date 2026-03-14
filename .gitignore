@@ -8,3 +8,5 @@ __pycache__/
 *.log
 .python-version
 README.md
+/skills/
+SOUL.md
