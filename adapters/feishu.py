@@ -1,10 +1,12 @@
+import asyncio
 import json
 import logging
 import os
 import ssl
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from agent.core import AgentResponse
 from agent.media import (
@@ -37,6 +39,11 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
     CreateMessageRequest,
     CreateMessageRequestBody,
+    CreateMessageReactionRequest,
+    CreateMessageReactionRequestBody,
+    DeleteMessageReactionRequest,
+    Emoji,
+    ListMessageReactionRequest,
 )
 
 from adapters.base import BaseAdapter
@@ -51,6 +58,15 @@ from config import (
 from storage.session import archive_session, list_sessions, load_session
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class FeishuMessage:
+    msg_type: str
+    message: Any
+    chat_id: str
+    user_id: str
+    message_id: str
 
 
 class FeishuAdapter(BaseAdapter):
@@ -73,8 +89,18 @@ class FeishuAdapter(BaseAdapter):
         self._max_cache_size = 1000
         self._pending_media: dict[str, dict] = {}
         self.bot_open_id = os.getenv("FEISHU_BOT_OPEN_ID")
+        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._user_queues: dict[str, asyncio.Queue] = {}
+        self._user_workers: dict[str, asyncio.Task] = {}
 
-        # 消息处理回调函数（使用官方示例的函数式写法）
+        self.api_client = (
+            lark.Client.builder()
+            .app_id(app_id)
+            .app_secret(app_secret)
+            .log_level(lark.LogLevel.DEBUG)
+            .build()
+        )
+
         def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
             logger.info(
                 f"Received message event: {lark.JSON.marshal(data.event.message.message_id) if data.event and data.event.message else 'unknown'}"
@@ -82,7 +108,6 @@ class FeishuAdapter(BaseAdapter):
             logger.debug(f"{lark.JSON.marshal(data)}")
             self._handle_message_event(data)
 
-        # 创建事件处理器 - 日志等级设为 DEBUG
         event_handler = (
             lark.EventDispatcherHandler.builder(
                 encrypt_key or "",
@@ -93,7 +118,6 @@ class FeishuAdapter(BaseAdapter):
             .build()
         )
 
-        # 创建 WebSocket 客户端 - 日志等级设为 DEBUG
         self.ws_client = lark.ws.Client(
             app_id=app_id,
             app_secret=app_secret,
@@ -102,18 +126,157 @@ class FeishuAdapter(BaseAdapter):
             auto_reconnect=True,
         )
 
-        # REST API 客户端 - 日志等级设为 DEBUG
-        self.api_client = (
-            lark.Client.builder()
-            .app_id(app_id)
-            .app_secret(app_secret)
-            .log_level(lark.LogLevel.DEBUG)
-            .build()
-        )
         logger.info(f"Adapter initialized with app_id: {app_id[:10]}...")
 
+    def set_event_loop(self, loop: asyncio.AbstractEventLoop):
+        self._event_loop = loop
+
+    async def _get_or_create_user_queue(self, user_id: str) -> asyncio.Queue:
+        if user_id not in self._user_queues:
+            self._user_queues[user_id] = asyncio.Queue()
+            worker = asyncio.create_task(self._user_worker(user_id))
+            self._user_workers[user_id] = worker
+            logger.info(f"[Feishu] created queue and worker for user {user_id}")
+        return self._user_queues[user_id]
+
+    async def _user_worker(self, user_id: str):
+        queue = self._user_queues[user_id]
+        logger.info(f"[Feishu] worker started for user {user_id}")
+        while True:
+            try:
+                msg: FeishuMessage = await queue.get()
+                try:
+                    await self._process_message(msg)
+                except Exception as e:
+                    logger.error(
+                        f"[Feishu] error processing message for user {user_id}: {e}"
+                    )
+                finally:
+                    queue.task_done()
+            except asyncio.CancelledError:
+                logger.info(f"[Feishu] worker cancelled for user {user_id}")
+                break
+            except Exception as e:
+                logger.error(f"[Feishu] worker error for user {user_id}: {e}")
+
+    async def _process_message(self, msg: FeishuMessage):
+        if msg.msg_type == "text":
+            await self._process_text_message(msg)
+        elif msg.msg_type == "file":
+            await self._process_file_message(msg)
+
+    async def _process_text_message(self, msg: FeishuMessage):
+        content = json.loads(msg.message.content)
+        text = content.get("text", "").strip()
+
+        if not text:
+            return
+
+        if text.startswith("/"):
+            await self._handle_command(text, msg.chat_id, msg.user_id)
+            return
+
+        needs_thinking = await self.agent.check_intent(text)
+
+        reaction_type = "THINKING" if needs_thinking else "OneSecond"
+        await asyncio.to_thread(
+            self._add_message_reaction, msg.message_id, reaction_type
+        )
+
+        try:
+            pending = self._pending_media.get(msg.chat_id)
+            if pending and pending.get("type") == "image":
+                image_data = pending.get("image_data")
+                self._pending_media.pop(msg.chat_id, None)
+
+                image_url = image_to_base64_url(image_data)
+                multimodal_content = [
+                    {"type": "text", "text": text},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ]
+                model = get_user_model(self.platform_name, msg.chat_id)
+                response = await self.agent.run(
+                    self.platform_name,
+                    msg.chat_id,
+                    multimodal_content,
+                    model,
+                    needs_thinking,
+                )
+            else:
+                model = get_user_model(self.platform_name, msg.chat_id)
+                response = await self.agent.run(
+                    self.platform_name, msg.chat_id, text, model, needs_thinking
+                )
+
+            await self._send_agent_response(msg.chat_id, response)
+        finally:
+            await asyncio.to_thread(
+                self._remove_message_reaction, msg.message_id, reaction_type
+            )
+
+    async def _process_file_message(self, msg: FeishuMessage):
+        content = json.loads(msg.message.content)
+        file_key = content.get("file_key")
+        filename = content.get("file_name", "unknown_file")
+
+        if not file_key:
+            logger.warning("No file_key in message")
+            return
+
+        needs_thinking = True
+        reaction_type = "THINKING" if needs_thinking else "OneSecond"
+        await asyncio.to_thread(
+            self._add_message_reaction, msg.message_id, reaction_type
+        )
+
+        try:
+            logger.info(f"Processing file: {filename}")
+            filepath, file_size = await asyncio.to_thread(
+                download_feishu_file, self.api_client, file_key, filename
+            )
+
+            if filepath is None:
+                if file_size and file_size > 0:
+                    size_mb = file_size / (1024 * 1024)
+                    await self._send_message_async(
+                        msg.chat_id,
+                        f"文件太大了 ({size_mb:.1f}MB)，超过 10MB 限制，无法处理",
+                    )
+                else:
+                    await self._send_message_async(
+                        msg.chat_id, "文件下载失败，请稍后重试"
+                    )
+                return
+
+            await self._send_message_async(
+                msg.chat_id, f"📁 已收到文件 {filename}，正在解析..."
+            )
+
+            parsed_content = await asyncio.to_thread(parse_file_content, filepath)
+            if parsed_content is None:
+                await self._send_message_async(
+                    msg.chat_id, "文件解析失败，不支持的格式"
+                )
+                return
+
+            prompt = f"""用户上传了一个文件「{filename}」，以下是文件内容：
+
+{parsed_content}
+
+请总结这个文件的主要内容。"""
+
+            model = get_user_model(self.platform_name, msg.chat_id)
+            response = await self.agent.run(
+                self.platform_name, msg.chat_id, prompt, model, needs_thinking
+            )
+
+            await self._send_agent_response(msg.chat_id, response)
+        finally:
+            await asyncio.to_thread(
+                self._remove_message_reaction, msg.message_id, reaction_type
+            )
+
     def start(self):
-        """启动 WebSocket 连接（阻塞式）"""
         logger.info("Starting WebSocket connection...")
         logger.info(f"App ID: {self.app_id}")
         logger.info(
@@ -122,50 +285,49 @@ class FeishuAdapter(BaseAdapter):
         self.ws_client.start()
 
     async def send_message(self, chat_id: str, text: str):
-        """发送消息到飞书"""
-        logger.debug(f"Sending message to chat_id: {chat_id}")
-        request = (
-            CreateMessageRequest.builder()
-            .receive_id_type("chat_id")
-            .request_body(
-                CreateMessageRequestBody.builder()
-                .receive_id(chat_id)
-                .msg_type("text")
-                .content(json.dumps({"text": text}, ensure_ascii=False))
+        await self._send_message_async(chat_id, text)
+
+    async def _send_message_async(self, chat_id: str, text: str):
+        try:
+            request = (
+                CreateMessageRequest.builder()
+                .receive_id_type("chat_id")
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type("text")
+                    .content(json.dumps({"text": text}, ensure_ascii=False))
+                    .build()
+                )
                 .build()
             )
-            .build()
-        )
 
-        response = self.api_client.im.v1.message.create(request)
-
-        if response.success():
-            logger.debug("Message sent successfully")
-        else:
-            logger.error(
-                f"Failed to send message: code={response.code}, "
-                f"msg={response.msg}, log_id={response.get_log_id()}"
+            response = await asyncio.to_thread(
+                self.api_client.im.v1.message.create, request
             )
 
+            if not response.success():
+                logger.error(
+                    f"Failed to send message: code={response.code}, "
+                    f"msg={response.msg}, log_id={response.get_log_id()}"
+                )
+        except Exception as e:
+            logger.error(f"Error sending message: {e}")
+
     async def send_to_owner(self, text: str):
-        """发送消息给主人"""
         chat_id = get_owner_chat_id()
         if chat_id:
-            logger.debug(f"Sending message to owner: {chat_id}")
             await self.send_message(chat_id, text)
         else:
             logger.warning("Owner chat_id not set yet")
 
     async def handle_message(self, user_id: str, text: str) -> AgentResponse:
-        """处理消息并返回回复"""
         if get_owner_chat_id() is None:
-            logger.info(f"Setting owner to user_id: {user_id}")
             save_owner_chat_id(user_id)
         model = get_user_model(self.platform_name, user_id)
-        return self.agent.run(self.platform_name, user_id, text, model)
+        return await self.agent.run(self.platform_name, user_id, text, model)
 
     def _handle_message_event(self, data: lark.im.v1.P2ImMessageReceiveV1):
-        """处理收到的消息事件"""
         logger.debug("Processing message event...")
         try:
             event = data.event
@@ -201,51 +363,39 @@ class FeishuAdapter(BaseAdapter):
             msg_type = message.message_type
 
             if msg_type == "text":
-                self._handle_text_message(message, chat_id, user_id)
+                self._queue_message(msg_type, message, chat_id, user_id, message_id)
             elif msg_type == "image":
-                self._handle_image_message(message, chat_id)
+                self._handle_image_message_sync(message, chat_id, message_id)
             elif msg_type == "file":
-                self._handle_file_message(message, chat_id)
+                self._queue_message(msg_type, message, chat_id, user_id, message_id)
             else:
                 logger.debug(f"Unsupported message type: {msg_type}")
 
         except Exception as e:
             logger.error(f"Error handling message: {e}", exc_info=True)
 
-    def _handle_text_message(self, message, chat_id: str, user_id: str):
-        """处理文本消息"""
-        content = json.loads(message.content)
-        text = content.get("text", "").strip()
-
-        if not text:
+    def _queue_message(
+        self, msg_type: str, message, chat_id: str, user_id: str, message_id: str
+    ):
+        if not self._event_loop:
+            logger.error("Event loop not set, cannot queue message")
             return
 
-        if text.startswith("/"):
-            self._handle_command(text, chat_id, user_id)
-            return
-
-        pending = self._pending_media.get(chat_id)
-        if pending and pending.get("type") == "image":
-            image_data = pending.get("image_data")
-            self._pending_media.pop(chat_id, None)
-
-            image_url = image_to_base64_url(image_data)
-            multimodal_content = [
-                {"type": "text", "text": text},
-                {"type": "image_url", "image_url": {"url": image_url}},
-            ]
-            model = get_user_model(self.platform_name, chat_id)
-            response = self.agent.run(
-                self.platform_name, chat_id, multimodal_content, model
+        async def enqueue():
+            queue = await self._get_or_create_user_queue(user_id)
+            msg = FeishuMessage(
+                msg_type=msg_type,
+                message=message,
+                chat_id=chat_id,
+                user_id=user_id,
+                message_id=message_id,
             )
-        else:
-            model = get_user_model(self.platform_name, chat_id)
-            response = self.agent.run(self.platform_name, chat_id, text, model)
+            await queue.put(msg)
+            logger.debug(f"[Feishu] queued {msg_type} message for user {user_id}")
 
-        self._send_agent_response(chat_id, response)
+        asyncio.run_coroutine_threadsafe(enqueue(), self._event_loop)
 
-    def _handle_image_message(self, message, chat_id: str):
-        """处理图片消息"""
+    def _handle_image_message_sync(self, message, chat_id: str, message_id: str):
         content = json.loads(message.content)
         image_key = content.get("image_key")
 
@@ -269,63 +419,23 @@ class FeishuAdapter(BaseAdapter):
 
         self._send_message_sync(chat_id, "📷 已收到图片！请告诉我你想了解什么？")
 
-    def _handle_file_message(self, message, chat_id: str):
-        """处理文件消息"""
-        content = json.loads(message.content)
-        file_key = content.get("file_key")
-        filename = content.get("file_name", "unknown_file")
-
-        if not file_key:
-            logger.warning("No file_key in message")
-            return
-
-        logger.info(f"Processing file: {filename}")
-        filepath, file_size = download_feishu_file(self.api_client, file_key, filename)
-
-        if filepath is None:
-            if file_size and file_size > 0:
-                size_mb = file_size / (1024 * 1024)
-                self._send_message_sync(
-                    chat_id, f"文件太大了 ({size_mb:.1f}MB)，超过 10MB 限制，无法处理"
-                )
-            else:
-                self._send_message_sync(chat_id, "文件下载失败，请稍后重试")
-            return
-
-        self._send_message_sync(chat_id, f"📁 已收到文件 {filename}，正在解析...")
-
-        parsed_content = parse_file_content(filepath)
-        if parsed_content is None:
-            self._send_message_sync(chat_id, "文件解析失败，不支持的格式")
-            return
-
-        prompt = f"""用户上传了一个文件「{filename}」，以下是文件内容：
-
-{parsed_content}
-
-请总结这个文件的主要内容。"""
-
-        model = get_user_model(self.platform_name, chat_id)
-        response = self.agent.run(self.platform_name, chat_id, prompt, model)
-        self._send_agent_response(chat_id, response)
-
-    def _handle_command(self, command: str, chat_id: str, user_id: str):
-        """处理命令"""
+    async def _handle_command(self, command: str, chat_id: str, user_id: str):
         parts = command.split()
         cmd = parts[0].lower()
 
         if cmd == "/new":
-            self._handle_new_session(chat_id, user_id)
+            await self._handle_new_session(chat_id, user_id)
         elif cmd == "/sessions":
-            self._handle_list_sessions(chat_id, user_id)
+            await self._handle_list_sessions(chat_id, user_id)
         elif cmd == "/model":
             args = parts[1:] if len(parts) > 1 else []
-            self._handle_model(chat_id, user_id, args)
+            await self._handle_model(chat_id, user_id, args)
 
-    def _handle_new_session(self, chat_id: str, user_id: str):
-        """处理 /new 命令"""
+    async def _handle_new_session(self, chat_id: str, user_id: str):
         try:
-            messages = load_session(self.platform_name, user_id)
+            messages = await asyncio.to_thread(
+                load_session, self.platform_name, user_id
+            )
 
             if messages:
                 prompt = f"""请从以下对话中提取关键信息，包括：
@@ -339,48 +449,45 @@ class FeishuAdapter(BaseAdapter):
 请用简洁的语言列出这些关键信息，每条不超过 20 字。"""
 
                 model = get_user_model(self.platform_name, user_id)
-                summary = (
-                    self.agent.client.chat.completions.create(
-                        model=model,
-                        messages=[{"role": "user", "content": prompt}],
-                    )
-                    .choices[0]
-                    .message.content
+                response = await self.agent.client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
                 )
+                summary = response.choices[0].message.content
 
                 timestamp = datetime.now().strftime("%Y%m%d")
-                save_memory(f"session_{timestamp}", summary)
+                await asyncio.to_thread(save_memory, f"session_{timestamp}", summary)
 
-            archive_session(self.platform_name, user_id)
-            self._send_message_sync(
+            await asyncio.to_thread(archive_session, self.platform_name, user_id)
+            await self._send_message_async(
                 chat_id, "已创建新会话啦！之前的话题已保存到记忆里～"
             )
 
         except Exception as e:
             logger.error(f"Error handling /new command: {e}")
-            self._send_message_sync(chat_id, "创建新会话时出错了，请稍后再试")
+            await self._send_message_async(chat_id, "创建新会话时出错了，请稍后再试")
 
-    def _handle_list_sessions(self, chat_id: str, user_id: str):
-        """处理 /sessions 命令"""
+    async def _handle_list_sessions(self, chat_id: str, user_id: str):
         try:
-            sessions = list_sessions(self.platform_name, user_id)
+            sessions = await asyncio.to_thread(
+                list_sessions, self.platform_name, user_id
+            )
 
             if not sessions:
-                self._send_message_sync(chat_id, "还没有历史会话记录哦～")
+                await self._send_message_async(chat_id, "还没有历史会话记录哦～")
                 return
 
             lines = ["📁 历史会话："]
             for s in sessions[:10]:
                 lines.append(f"- {s['created']}: {s['filename']}")
 
-            self._send_message_sync(chat_id, "\n".join(lines))
+            await self._send_message_async(chat_id, "\n".join(lines))
 
         except Exception as e:
             logger.error(f"Error handling /sessions command: {e}")
-            self._send_message_sync(chat_id, "获取历史会话时出错了")
+            await self._send_message_async(chat_id, "获取历史会话时出错了")
 
-    def _handle_model(self, chat_id: str, user_id: str, args: list[str]):
-        """处理 /model 命令"""
+    async def _handle_model(self, chat_id: str, user_id: str, args: list[str]):
         try:
             if not args:
                 current_model = get_user_model(self.platform_name, user_id)
@@ -388,26 +495,25 @@ class FeishuAdapter(BaseAdapter):
                 for i, model in enumerate(AVAILABLE_MODELS, 1):
                     marker = " (当前)" if model == current_model else ""
                     lines.append(f"{i}. {model}{marker}")
-                self._send_message_sync(chat_id, "\n".join(lines))
+                await self._send_message_async(chat_id, "\n".join(lines))
                 return
 
             new_model = args[0]
             if new_model not in AVAILABLE_MODELS:
-                self._send_message_sync(
+                await self._send_message_async(
                     chat_id,
                     f"无效的模型: {new_model}\n可用模型: {', '.join(AVAILABLE_MODELS)}",
                 )
                 return
 
             save_user_model(self.platform_name, user_id, new_model)
-            self._send_message_sync(chat_id, f"已切换到模型: {new_model}")
+            await self._send_message_async(chat_id, f"已切换到模型: {new_model}")
 
         except Exception as e:
             logger.error(f"Error handling /model command: {e}")
-            self._send_message_sync(chat_id, "切换模型时出错了")
+            await self._send_message_async(chat_id, "切换模型时出错了")
 
     def _send_message_sync(self, chat_id: str, text: str):
-        """同步发送消息"""
         try:
             request = (
                 CreateMessageRequest.builder()
@@ -433,8 +539,7 @@ class FeishuAdapter(BaseAdapter):
         except Exception as e:
             logger.error(f"Error sending message: {e}")
 
-    def _send_agent_response(self, chat_id: str, response: AgentResponse):
-        """发送 Agent 响应，包含思考过程和最终回复"""
+    async def _send_agent_response(self, chat_id: str, response: AgentResponse):
         if response.reasoning:
             formatted_text = f"""💭 思考过程：
 {response.reasoning}
@@ -445,10 +550,79 @@ class FeishuAdapter(BaseAdapter):
         else:
             formatted_text = response.content
 
-        self._send_message_sync(chat_id, formatted_text)
+        await self._send_message_async(chat_id, formatted_text)
+
+    def _add_message_reaction(self, message_id: str, emoji_type: str) -> bool:
+        try:
+            request = (
+                CreateMessageReactionRequest.builder()
+                .message_id(message_id)
+                .request_body(
+                    CreateMessageReactionRequestBody.builder()
+                    .reaction_type(Emoji.builder().emoji_type(emoji_type).build())
+                    .build()
+                )
+                .build()
+            )
+
+            response = self.api_client.im.v1.message_reaction.create(request)
+
+            if response.success():
+                logger.info(f"Reaction {emoji_type} added to message {message_id}")
+                return True
+            else:
+                logger.error(
+                    f"Failed to add reaction: code={response.code}, msg={response.msg}"
+                )
+                return False
+
+        except Exception as e:
+            logger.error(f"Error adding reaction: {e}")
+            return False
+
+    def _remove_message_reaction(self, message_id: str, reaction_type: str) -> bool:
+        try:
+            list_request = (
+                ListMessageReactionRequest.builder()
+                .message_id(message_id)
+                .reaction_type(reaction_type)
+                .page_size(100)
+                .build()
+            )
+
+            list_response = self.api_client.im.v1.message_reaction.list(list_request)
+
+            if not list_response.success():
+                logger.error(f"Failed to list reactions: code={list_response.code}")
+                return False
+
+            if list_response.data and list_response.data.items:
+                for item in list_response.data.items:
+                    if item.reaction_id:
+                        delete_request = (
+                            DeleteMessageReactionRequest.builder()
+                            .message_id(message_id)
+                            .reaction_id(item.reaction_id)
+                            .build()
+                        )
+
+                        delete_response = self.api_client.im.v1.message_reaction.delete(
+                            delete_request
+                        )
+
+                        if delete_response.success():
+                            logger.debug(
+                                f"Reaction {reaction_type} removed from message {message_id}"
+                            )
+                            return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"Error removing reaction: {e}")
+            return False
 
     def _is_bot_mentioned(self, message) -> bool:
-        """检查消息是否 @ 了机器人"""
         if not self.bot_open_id:
             logger.warning("Bot open_id not configured, skipping mention check")
             return False
