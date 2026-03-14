@@ -19,7 +19,11 @@ AVAILABLE_MODELS = [
 ]
 DEFAULT_MODEL = "qwen3.5-plus"
 
-THINKING_MODELS = ["kimi-k2.5"]
+# 所有模型都支持深度思考
+THINKING_MODELS = AVAILABLE_MODELS
+
+# 意图判断专用模型
+INTENT_MODEL = "glm-4.7"
 
 MAX_FILE_SIZE = 10 * 1024 * 1024
 UPLOAD_DIR = os.path.join(CONFIG_DIR, "uploads")
