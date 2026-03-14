@@ -1,5 +1,8 @@
 from abc import ABC, abstractmethod
 
+from agent.core import AgentResponse
+
+
 class BaseAdapter(ABC):
     platform_name: str
 
@@ -14,6 +17,6 @@ class BaseAdapter(ABC):
         pass
 
     @abstractmethod
-    async def handle_message(self, user_id: str, text: str) -> str:
+    async def handle_message(self, user_id: str, text: str) -> AgentResponse:
         """处理消息 - 调用 agent 并返回回复"""
         pass
