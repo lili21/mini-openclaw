@@ -1,3 +1,8 @@
+import asyncio
+import json
+import logging
+from dataclasses import dataclass
+
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, CommandHandler
 
@@ -11,7 +16,15 @@ from config import (
     AVAILABLE_MODELS,
 )
 from storage.session import archive_session, list_sessions, load_session
-import json
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class UserMessage:
+    update: Update
+    user_id: str
+    text: str
 
 
 class TelegramAdapter(BaseAdapter):
@@ -21,6 +34,8 @@ class TelegramAdapter(BaseAdapter):
         self.token = token
         self.agent = agent
         self.app = None
+        self._user_queues: dict[str, asyncio.Queue] = {}
+        self._user_workers: dict[str, asyncio.Task] = {}
 
     def start(self):
         self.app = Application.builder().token(self.token).build()
@@ -29,6 +44,75 @@ class TelegramAdapter(BaseAdapter):
         self.app.add_handler(CommandHandler("model", self._handle_model))
         self.app.add_handler(MessageHandler(filters.TEXT, self._handle_update))
         self.app.run_polling()
+
+    async def _get_or_create_user_queue(self, user_id: str) -> asyncio.Queue:
+        if user_id not in self._user_queues:
+            self._user_queues[user_id] = asyncio.Queue()
+            worker = asyncio.create_task(self._user_worker(user_id))
+            self._user_workers[user_id] = worker
+            logger.info(f"[Telegram] created queue and worker for user {user_id}")
+        return self._user_queues[user_id]
+
+    async def _user_worker(self, user_id: str):
+        queue = self._user_queues[user_id]
+        logger.info(f"[Telegram] worker started for user {user_id}")
+        while True:
+            try:
+                msg: UserMessage = await queue.get()
+                try:
+                    await self._process_message(msg)
+                except Exception as e:
+                    logger.error(
+                        f"[Telegram] error processing message for user {user_id}: {e}"
+                    )
+                finally:
+                    queue.task_done()
+            except asyncio.CancelledError:
+                logger.info(f"[Telegram] worker cancelled for user {user_id}")
+                break
+            except Exception as e:
+                logger.error(f"[Telegram] worker error for user {user_id}: {e}")
+
+    async def _process_message(self, msg: UserMessage):
+        update = msg.update
+        user_id = msg.user_id
+        user_message = msg.text
+
+        if get_owner_chat_id() is None:
+            save_owner_chat_id(user_id)
+
+        needs_thinking = await self.agent.check_intent(user_message)
+
+        try:
+            if needs_thinking:
+                await update.message.set_reaction("🧠")
+            else:
+                await update.message.set_reaction("👀")
+        except Exception:
+            pass
+
+        try:
+            model = get_user_model(self.platform_name, user_id)
+            response = await self.agent.run(
+                self.platform_name, user_id, user_message, model, needs_thinking
+            )
+
+            if response.reasoning:
+                formatted_text = f"""💭 思考过程：
+{response.reasoning}
+
+━━━━━━━━━━
+
+{response.content}"""
+            else:
+                formatted_text = response.content
+
+            await update.message.reply_text(formatted_text)
+        finally:
+            try:
+                await update.message.set_reaction(reaction=None)
+            except Exception:
+                pass
 
     async def send_message(self, chat_id: str, text: str):
         if self.app:
@@ -44,12 +128,12 @@ class TelegramAdapter(BaseAdapter):
             save_owner_chat_id(user_id)
 
         model = get_user_model(self.platform_name, user_id)
-        return self.agent.run(self.platform_name, user_id, text, model)
+        return await self.agent.run(self.platform_name, user_id, text, model)
 
     async def _handle_new(self, update: Update, context):
         user_id = str(update.effective_user.id)
 
-        messages = load_session(self.platform_name, user_id)
+        messages = await asyncio.to_thread(load_session, self.platform_name, user_id)
 
         if messages:
             prompt = f"""请从以下对话中提取关键信息，包括：
@@ -63,28 +147,25 @@ class TelegramAdapter(BaseAdapter):
 请用简洁的语言列出这些关键信息，每条不超过20字。"""
 
             model = get_user_model(self.platform_name, user_id)
-            summary = (
-                self.agent.client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                .choices[0]
-                .message.content
+            response = await self.agent.client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
             )
+            summary = response.choices[0].message.content
 
             from agent.tools import save_memory
 
             timestamp = update.message.date.strftime("%Y%m%d")
-            save_memory(f"session_{timestamp}", summary)
+            await asyncio.to_thread(save_memory, f"session_{timestamp}", summary)
 
-        archive_session(self.platform_name, user_id)
+        await asyncio.to_thread(archive_session, self.platform_name, user_id)
 
         await update.message.reply_text("已创建新会话啦！之前的话题已保存到记忆里～")
 
     async def _handle_sessions(self, update: Update, context):
         user_id = str(update.effective_user.id)
 
-        sessions = list_sessions(self.platform_name, user_id)
+        sessions = await asyncio.to_thread(list_sessions, self.platform_name, user_id)
 
         if not sessions:
             await update.message.reply_text("还没有历史会话记录哦～")
@@ -126,19 +207,7 @@ class TelegramAdapter(BaseAdapter):
         user_id = str(update.effective_user.id)
         user_message = update.message.text
 
-        if get_owner_chat_id() is None:
-            save_owner_chat_id(user_id)
-
-        response = await self.handle_message(user_id, user_message)
-
-        if response.reasoning:
-            formatted_text = f"""💭 思考过程：
-{response.reasoning}
-
-━━━━━━━━━━
-
-{response.content}"""
-        else:
-            formatted_text = response.content
-
-        await update.message.reply_text(formatted_text)
+        queue = await self._get_or_create_user_queue(user_id)
+        msg = UserMessage(update=update, user_id=user_id, text=user_message)
+        await queue.put(msg)
+        logger.debug(f"[Telegram] queued message for user {user_id}")
