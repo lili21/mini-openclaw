@@ -1,8 +1,7 @@
 import os
 import re
-import json
 import subprocess
-from typing import Any, Callable
+from typing import Callable
 
 DANGEROUS_PATTERNS = [
     r"\brm\b.*-rf",

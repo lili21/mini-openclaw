@@ -1,8 +1,11 @@
 import os
 import re
+import logging
 from dataclasses import dataclass
 from typing import Optional
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -10,6 +13,7 @@ class Skill:
     name: str
     description: str
     path: str
+    source: str = "project"
     content: Optional[str] = None
 
 
@@ -17,6 +21,7 @@ PROJECT_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 SKILLS_DIR = os.path.join(PROJECT_ROOT, "skills")
+GLOBAL_SKILLS_DIR = os.path.expanduser("~/.agent/skills")
 
 
 def parse_frontmatter(content: str) -> dict:
@@ -31,7 +36,7 @@ def parse_frontmatter(content: str) -> dict:
         return {}
 
 
-def load_skill_metadata(skill_path: str) -> Optional[dict]:
+def load_skill_metadata(skill_path: str, source: str = "project") -> Optional[dict]:
     skill_md_path = os.path.join(skill_path, "SKILL.md")
     if not os.path.isfile(skill_md_path):
         return None
@@ -45,6 +50,7 @@ def load_skill_metadata(skill_path: str) -> Optional[dict]:
             "name": frontmatter.get("name", ""),
             "description": frontmatter.get("description", ""),
             "path": skill_path,
+            "source": source,
         }
     except Exception:
         return None
@@ -65,32 +71,49 @@ def load_skill_content(skill_path: str) -> Optional[str]:
 
 
 def get_available_skills() -> list[dict]:
-    if not os.path.isdir(SKILLS_DIR):
-        return []
     skills = []
-    for entry in os.listdir(SKILLS_DIR):
-        skill_path = os.path.join(SKILLS_DIR, entry)
-        if os.path.isdir(skill_path):
-            metadata = load_skill_metadata(skill_path)
-            if metadata:
-                skills.append(metadata)
+    seen_names = set()
+
+    for skills_dir, source in [(SKILLS_DIR, "project"), (GLOBAL_SKILLS_DIR, "global")]:
+        if not os.path.isdir(skills_dir):
+            continue
+        for entry in os.listdir(skills_dir):
+            skill_path = os.path.join(skills_dir, entry)
+            if os.path.isdir(skill_path):
+                metadata = load_skill_metadata(skill_path, source)
+                if metadata:
+                    name = metadata["name"]
+                    if name not in seen_names:
+                        seen_names.add(name)
+                        skills.append(metadata)
+                        logger.info(
+                            f"[Skills] Loaded skill '{name}' from {source}: {skill_path}"
+                        )
+                    else:
+                        logger.debug(
+                            f"[Skills] Skipped duplicate skill '{name}' from {source}"
+                        )
+
     return skills
 
 
 def get_skill(name: str) -> Optional[Skill]:
-    skill_path = os.path.join(SKILLS_DIR, name)
-    if not os.path.isdir(skill_path):
-        return None
-    metadata = load_skill_metadata(skill_path)
-    if not metadata:
-        return None
-    content = load_skill_content(skill_path)
-    return Skill(
-        name=metadata["name"],
-        description=metadata["description"],
-        path=metadata["path"],
-        content=content,
-    )
+    for skills_dir, source in [(SKILLS_DIR, "project"), (GLOBAL_SKILLS_DIR, "global")]:
+        skill_path = os.path.join(skills_dir, name)
+        if os.path.isdir(skill_path):
+            metadata = load_skill_metadata(skill_path, source)
+            if metadata:
+                content = load_skill_content(skill_path)
+                logger.info(f"[Skills] Loaded skill '{name}' from {source}")
+                return Skill(
+                    name=metadata["name"],
+                    description=metadata["description"],
+                    path=metadata["path"],
+                    source=source,
+                    content=content,
+                )
+    logger.warning(f"[Skills] Skill '{name}' not found in project or global directory")
+    return None
 
 
 def generate_skills_prompt() -> str:
