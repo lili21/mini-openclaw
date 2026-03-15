@@ -111,6 +111,14 @@ class FeishuAdapter(BaseAdapter):
             "FEISHU_STREAM_OUTPUT_INCLUDE_REASONING", False
         )
         self._stream_card_max_chars = 3200
+        logger.info(
+            "[Feishu] stream output config: "
+            f"enabled={self._stream_output_enabled}, "
+            f"interval={self._stream_interval_seconds}s, "
+            f"flush_chars={self._stream_flush_chars}, "
+            f"flush_each_chunk={self._stream_flush_each_chunk}, "
+            f"include_reasoning={self._stream_include_reasoning}"
+        )
 
         self.api_client = (
             lark.Client.builder()
@@ -213,7 +221,8 @@ class FeishuAdapter(BaseAdapter):
             await self._handle_command(text, msg.chat_id, msg.user_id)
             return
 
-        needs_thinking = await self.agent.check_intent(text)
+        # needs_thinking = await self.agent.check_intent(text)
+        needs_thinking = False
 
         reaction_type = "THINKING" if needs_thinking else "OneSecond"
         await asyncio.to_thread(
@@ -344,6 +353,9 @@ class FeishuAdapter(BaseAdapter):
         needs_thinking: bool,
     ) -> AgentResponse | None:
         if not self._stream_output_enabled:
+            logger.info(
+                "[Feishu] stream output disabled by FEISHU_STREAM_OUTPUT, fallback to agent.run"
+            )
             response = await self.agent.run(
                 self.platform_name, chat_id, content, model, needs_thinking
             )
@@ -498,9 +510,8 @@ class FeishuAdapter(BaseAdapter):
                 has_error_handled = has_error_handled or updated
 
             if not has_error_handled:
-                await self._send_message_async(
-                    chat_id,
-                    "飞书流式生成出现异常，请稍后重试。",
+                logger.warning(
+                    "[Feishu] stream failed before final response, fallback to non-stream"
                 )
             return None
 

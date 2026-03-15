@@ -103,6 +103,9 @@ class Agent:
             extra_kwargs["extra_body"] = {"enable_thinking": True}
             logger.info(f"[Agent] deep thinking enabled for model: {actual_model}")
 
+        assistant_content = ""
+        reasoning_content: str | None = None
+
         for i in range(self.max_iterations):
             logger.info(f"[Agent] iteration {i + 1}/{self.max_iterations}")
             response = await self.client.chat.completions.create(
@@ -160,9 +163,20 @@ class Agent:
                     compress_session(platform, user_id, self.client, actual_model)
                 )
 
-        logger.info(f"[Agent] run complete - platform={platform}, user_id={user_id}")
+                logger.info(
+                    f"[Agent] run complete - platform={platform}, user_id={user_id}"
+                )
+                return AgentResponse(
+                    content=assistant_content,
+                    reasoning=reasoning_content,
+                    needs_thinking=needs_thinking,
+                )
+
+        logger.warning(
+            f"[Agent] max iterations reached - platform={platform}, user_id={user_id}"
+        )
         return AgentResponse(
-            content=assistant_content,
+            content=assistant_content or "已达到最大迭代次数，请稍后重试",
             reasoning=reasoning_content,
             needs_thinking=needs_thinking,
         )
@@ -240,6 +254,8 @@ class Agent:
             assistant_content = ""
             reasoning_content = ""
             saw_tool_call = False
+            tool_calls: list[dict[str, Any]] = []
+            tool_calls_by_index: dict[int, dict[str, Any]] = {}
 
             async for chunk in response:
                 if not chunk.choices:
@@ -253,7 +269,35 @@ class Agent:
                 delta_tool_calls = getattr(delta, "tool_calls", None)
                 if delta_tool_calls:
                     saw_tool_call = True
-                    break
+                    for tool_call in delta_tool_calls:
+                        tool_index = getattr(tool_call, "index", None)
+                        if tool_index is None:
+                            continue
+
+                        entry = tool_calls_by_index.setdefault(
+                            tool_index,
+                            {
+                                "id": getattr(tool_call, "id", None),
+                                "type": getattr(tool_call, "type", "function"),
+                                "function": {"name": "", "arguments": ""},
+                            },
+                        )
+
+                        if getattr(tool_call, "id", None):
+                            entry["id"] = tool_call.id
+
+                        function_delta = getattr(tool_call, "function", None)
+                        if function_delta is None:
+                            continue
+
+                        function_name = getattr(function_delta, "name", None)
+                        if function_name:
+                            entry["function"]["name"] = function_name
+
+                        function_arguments = getattr(function_delta, "arguments", None)
+                        if function_arguments:
+                            entry["function"]["arguments"] += function_arguments
+                    continue
 
                 content_delta = delta.content or ""
                 reasoning_delta = getattr(delta, "reasoning_content", "") or ""
@@ -273,12 +317,71 @@ class Agent:
                             await result
 
             if saw_tool_call:
+                tool_calls = [
+                    tool_calls_by_index[index] for index in sorted(tool_calls_by_index)
+                ]
+
+                if not tool_calls:
+                    logger.warning(
+                        "[Agent] tool_calls detected but empty payload, fallback to normal run"
+                    )
+                    return await self.run(
+                        platform, user_id, content, actual_model, needs_thinking
+                    )
+
+                if any(
+                    not tool_call.get("id")
+                    or not tool_call.get("function", {}).get("name")
+                    for tool_call in tool_calls
+                ):
+                    logger.warning(
+                        "[Agent] tool_calls missing id or name, fallback to normal run"
+                    )
+                    return await self.run(
+                        platform, user_id, content, actual_model, needs_thinking
+                    )
+
                 logger.info(
-                    "[Agent] tool_calls detected in stream mode, fallback to normal run"
+                    f"[Agent] tool_calls detected in stream mode: {[tc['function'].get('name') for tc in tool_calls]}"
                 )
-                return await self.run(
-                    platform, user_id, content, actual_model, needs_thinking
+
+                full_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": tool_calls,
+                    }
                 )
+
+                for tool_call in tool_calls:
+                    func_name = tool_call["function"].get("name")
+                    func_args = tool_call["function"].get("arguments", "")
+
+                    try:
+                        parsed_args = json.loads(func_args) if func_args else {}
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            f"[Agent] tool call args json decode failed: {func_name}, fallback to normal run"
+                        )
+                        return await self.run(
+                            platform, user_id, content, actual_model, needs_thinking
+                        )
+
+                    logger.info(
+                        f"[Agent] executing tool: {func_name}, args={parsed_args}"
+                    )
+                    func: Callable = TOOL_FUNCTIONS[func_name]
+                    result = await asyncio.to_thread(func, **parsed_args)
+
+                    full_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.get("id", ""),
+                            "content": result,
+                        }
+                    )
+
+                continue
 
             if not assistant_content and not reasoning_content:
                 logger.warning(
