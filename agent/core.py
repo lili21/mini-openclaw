@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable
 
 from openai import AsyncOpenAI
@@ -80,7 +81,19 @@ class Agent:
         messages = load_session(platform, user_id)
         full_messages = [{"role": "system", "content": get_system_prompt()}] + messages
 
-        user_msg = {"role": "user", "content": content}
+        # 追加当前日期时间
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if isinstance(content, str):
+            content_with_time = f"{content}\n\n[当前时间: {current_time}]"
+        elif isinstance(content, list):
+            content_with_time = content + [
+                {"type": "text", "text": f"\n\n[当前时间: {current_time}]"}
+            ]
+        else:
+            content_with_time = content
+
+        user_msg = {"role": "user", "content": content_with_time}
+        user_msg_for_session = {"role": "user", "content": content}
         full_messages.append(user_msg)
 
         # 准备调用参数
@@ -132,7 +145,9 @@ class Agent:
                 if reasoning_content:
                     logger.info(f"[Agent] reasoning: {reasoning_content[:100]}...")
 
-                await asyncio.to_thread(append_to_session, platform, user_id, user_msg)
+                await asyncio.to_thread(
+                    append_to_session, platform, user_id, user_msg_for_session
+                )
                 await asyncio.to_thread(
                     append_to_session,
                     platform,
@@ -140,7 +155,10 @@ class Agent:
                     {"role": "assistant", "content": assistant_content},
                 )
 
-                await compress_session(platform, user_id, self.client, actual_model)
+                asyncio.create_task(
+                    compress_session(platform, user_id, self.client, actual_model)
+                )
+
                 logger.info(
                     f"[Agent] run complete - platform={platform}, user_id={user_id}"
                 )
