@@ -1,9 +1,10 @@
 import asyncio
+import inspect
 import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable, Optional
 
 from openai import AsyncOpenAI
 
@@ -159,16 +160,158 @@ class Agent:
                     compress_session(platform, user_id, self.client, actual_model)
                 )
 
+        logger.info(f"[Agent] run complete - platform={platform}, user_id={user_id}")
+        return AgentResponse(
+            content=assistant_content,
+            reasoning=reasoning_content,
+            needs_thinking=needs_thinking,
+        )
+
+    async def run_stream(
+        self,
+        platform: str,
+        user_id: str,
+        content: str | list[dict],
+        model: str | None = None,
+        needs_thinking: bool | None = None,
+        on_chunk: Optional[Callable[[str, str], Awaitable[None] | None]] = None,
+    ) -> AgentResponse:
+        """
+        流式生成回复
+
+        Args:
+            platform: 平台名称
+            user_id: 用户ID
+            content: 用户消息内容
+            model: 指定模型（可选）
+            needs_thinking: 是否需要深度思考（可选）
+            on_chunk: 分段回调，参数为 (content_delta, reasoning_delta)
+
+        Returns:
+            AgentResponse
+        """
+        actual_model = model or self.model
+        content_preview = (
+            content[:50]
+            if isinstance(content, str)
+            else f"[多模态消息，{len(content)}个元素]"
+        )
+        logger.info(
+            f"[Agent] start run_stream - platform={platform}, user_id={user_id}, model={actual_model}, message={content_preview}..."
+        )
+
+        if needs_thinking is None:
+            needs_thinking = await should_enable_thinking(content, self.client)
+
+        logger.info(f"[Agent] intent judgment: needs_thinking={needs_thinking}")
+
+        messages = load_session(platform, user_id)
+        full_messages = [{"role": "system", "content": get_system_prompt()}] + messages
+
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if isinstance(content, str):
+            content_with_time = f"{content}\n\n[当前时间: {current_time}]"
+        elif isinstance(content, list):
+            content_with_time = content + [
+                {"type": "text", "text": f"\n\n[当前时间: {current_time}]"}
+            ]
+        else:
+            content_with_time = content
+
+        user_msg = {"role": "user", "content": content_with_time}
+        user_msg_for_session = {"role": "user", "content": content}
+        full_messages.append(user_msg)
+
+        extra_kwargs: dict[str, Any] = {}
+        if needs_thinking and actual_model in THINKING_MODELS:
+            extra_kwargs["extra_body"] = {"enable_thinking": True}
+            logger.info(f"[Agent] deep thinking enabled for model: {actual_model}")
+
+        for i in range(self.max_iterations):
+            logger.info(f"[Agent] stream iteration {i + 1}/{self.max_iterations}")
+            response = await self.client.chat.completions.create(
+                model=actual_model,
+                messages=full_messages,
+                tools=TOOLS_SCHEMA,
+                stream=True,
+                **extra_kwargs,
+            )
+
+            assistant_content = ""
+            reasoning_content = ""
+            saw_tool_call = False
+
+            async for chunk in response:
+                if not chunk.choices:
+                    continue
+
+                choice = chunk.choices[0]
+                delta = choice.delta
+                if not delta:
+                    continue
+
+                delta_tool_calls = getattr(delta, "tool_calls", None)
+                if delta_tool_calls:
+                    saw_tool_call = True
+                    break
+
+                content_delta = delta.content or ""
+                reasoning_delta = getattr(delta, "reasoning_content", "") or ""
+
+                if content_delta:
+                    assistant_content += content_delta
+                    if on_chunk is not None:
+                        result = on_chunk(content_delta, "")
+                        if inspect.isawaitable(result):
+                            await result
+
+                if reasoning_delta:
+                    reasoning_content += reasoning_delta
+                    if on_chunk is not None:
+                        result = on_chunk("", reasoning_delta)
+                        if inspect.isawaitable(result):
+                            await result
+
+            if saw_tool_call:
                 logger.info(
-                    f"[Agent] run complete - platform={platform}, user_id={user_id}"
+                    "[Agent] tool_calls detected in stream mode, fallback to normal run"
                 )
-                return AgentResponse(
-                    content=assistant_content,
-                    reasoning=reasoning_content,
-                    needs_thinking=needs_thinking,
+                return await self.run(
+                    platform, user_id, content, actual_model, needs_thinking
                 )
 
+            if not assistant_content and not reasoning_content:
+                logger.warning(
+                    f"[Agent] stream returned no content - fallback to normal run - platform={platform}, user_id={user_id}"
+                )
+                return await self.run(
+                    platform, user_id, content, actual_model, needs_thinking
+                )
+
+            await asyncio.to_thread(
+                append_to_session, platform, user_id, user_msg_for_session
+            )
+            await asyncio.to_thread(
+                append_to_session,
+                platform,
+                user_id,
+                {"role": "assistant", "content": assistant_content},
+            )
+
+            asyncio.create_task(
+                compress_session(platform, user_id, self.client, actual_model)
+            )
+
+            logger.info(
+                f"[Agent] run_stream complete - platform={platform}, user_id={user_id}"
+            )
+            return AgentResponse(
+                content=assistant_content,
+                reasoning=reasoning_content,
+                needs_thinking=needs_thinking,
+            )
+
         logger.warning(
-            f"[Agent] max iterations reached - platform={platform}, user_id={user_id}"
+            f"[Agent] max stream iterations reached - platform={platform}, user_id={user_id}"
         )
-        return AgentResponse(content="已达到最大迭代次数")
+        return await self.run(platform, user_id, content, actual_model, needs_thinking)

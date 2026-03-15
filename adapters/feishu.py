@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import ssl
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
@@ -42,6 +43,10 @@ from lark_oapi.api.im.v1 import (
     CreateMessageReactionRequest,
     CreateMessageReactionRequestBody,
     DeleteMessageReactionRequest,
+    PatchMessageRequest,
+    PatchMessageRequestBodyBuilder,
+    UpdateMessageRequest,
+    UpdateMessageRequestBodyBuilder,
     Emoji,
     ListMessageReactionRequest,
 )
@@ -92,6 +97,14 @@ class FeishuAdapter(BaseAdapter):
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._user_queues: dict[str, asyncio.Queue] = {}
         self._user_workers: dict[str, asyncio.Task] = {}
+        self._stream_output_enabled = self._get_bool_env("FEISHU_STREAM_OUTPUT", True)
+        self._stream_interval_seconds = (
+            self._get_int_env("FEISHU_STREAM_OUTPUT_INTERVAL_MS", 1200) / 1000
+        )
+        self._stream_flush_chars = self._get_int_env(
+            "FEISHU_STREAM_OUTPUT_FLUSH_CHARS", 100
+        )
+        self._stream_card_max_chars = 3200
 
         self.api_client = (
             lark.Client.builder()
@@ -127,6 +140,24 @@ class FeishuAdapter(BaseAdapter):
         )
 
         logger.info(f"Adapter initialized with app_id: {app_id[:10]}...")
+
+    @staticmethod
+    def _get_bool_env(name: str, default: bool = False) -> bool:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _get_int_env(name: str, default: int) -> int:
+        value = os.getenv(name)
+        try:
+            return int(value) if value is not None else default
+        except ValueError:
+            logger.warning(
+                f"Invalid integer for {name}: {value}, use default {default}"
+            )
+            return default
 
     def set_event_loop(self, loop: asyncio.AbstractEventLoop):
         self._event_loop = loop
@@ -187,6 +218,11 @@ class FeishuAdapter(BaseAdapter):
             pending = self._pending_media.get(msg.chat_id)
             if pending and pending.get("type") == "image":
                 image_data = pending.get("image_data")
+                if image_data is None:
+                    await self._send_message_async(
+                        msg.chat_id, "图片数据异常，请重新发送图片"
+                    )
+                    return
                 self._pending_media.pop(msg.chat_id, None)
 
                 image_url = image_to_base64_url(image_data)
@@ -195,20 +231,35 @@ class FeishuAdapter(BaseAdapter):
                     {"type": "image_url", "image_url": {"url": image_url}},
                 ]
                 model = get_user_model(self.platform_name, msg.chat_id)
-                response = await self.agent.run(
-                    self.platform_name,
+                response = await self._run_agent_response_streaming(
                     msg.chat_id,
                     multimodal_content,
                     model,
                     needs_thinking,
                 )
+                if response is None:
+                    response = await self.agent.run(
+                        self.platform_name,
+                        msg.chat_id,
+                        multimodal_content,
+                        model,
+                        needs_thinking,
+                    )
+                    await self._send_agent_response(msg.chat_id, response)
             else:
                 model = get_user_model(self.platform_name, msg.chat_id)
-                response = await self.agent.run(
-                    self.platform_name, msg.chat_id, text, model, needs_thinking
+                response = await self._run_agent_response_streaming(
+                    msg.chat_id, text, model, needs_thinking
                 )
-
-            await self._send_agent_response(msg.chat_id, response)
+                if response is None:
+                    response = await self.agent.run(
+                        self.platform_name,
+                        msg.chat_id,
+                        text,
+                        model,
+                        needs_thinking,
+                    )
+                    await self._send_agent_response(msg.chat_id, response)
         finally:
             await asyncio.to_thread(
                 self._remove_message_reaction, msg.message_id, reaction_type
@@ -266,15 +317,143 @@ class FeishuAdapter(BaseAdapter):
 请总结这个文件的主要内容。"""
 
             model = get_user_model(self.platform_name, msg.chat_id)
-            response = await self.agent.run(
-                self.platform_name, msg.chat_id, prompt, model, needs_thinking
+            response = await self._run_agent_response_streaming(
+                msg.chat_id, prompt, model, needs_thinking
             )
-
-            await self._send_agent_response(msg.chat_id, response)
+            if response is None:
+                response = await self.agent.run(
+                    self.platform_name, msg.chat_id, prompt, model, needs_thinking
+                )
+                await self._send_agent_response(msg.chat_id, response)
         finally:
             await asyncio.to_thread(
                 self._remove_message_reaction, msg.message_id, reaction_type
             )
+
+    async def _run_agent_response_streaming(
+        self,
+        chat_id: str,
+        content: str | list[dict],
+        model: str,
+        needs_thinking: bool,
+    ) -> AgentResponse | None:
+        if not self._stream_output_enabled:
+            response = await self.agent.run(
+                self.platform_name, chat_id, content, model, needs_thinking
+            )
+            await self._send_agent_response(chat_id, response)
+            return response
+
+        stream_state = {
+            "message_id": None,
+            "reasoning": "",
+            "content": "",
+            "last_flush": 0.0,
+            "last_len": 0,
+            "use_interactive_card": True,
+        }
+
+        async def on_chunk(content_delta: str, reasoning_delta: str):
+            if not content_delta and not reasoning_delta:
+                return
+
+            if not stream_state["use_interactive_card"]:
+                return
+
+            if reasoning_delta:
+                stream_state["reasoning"] += reasoning_delta
+
+            if content_delta:
+                stream_state["content"] += content_delta
+
+            now = time.time()
+            should_flush = False
+            if stream_state["message_id"] is None:
+                should_flush = True
+            elif now - stream_state["last_flush"] >= self._stream_interval_seconds:
+                should_flush = True
+            elif (
+                len(stream_state["content"]) - stream_state["last_len"]
+                >= self._stream_flush_chars
+            ):
+                should_flush = True
+
+            if not should_flush:
+                return
+
+            if stream_state["message_id"] is None:
+                message_id = await self._send_interactive_message_async(
+                    chat_id,
+                    stream_state["reasoning"],
+                    stream_state["content"] or "正在生成回复...",
+                    status="思考中",
+                    finished=False,
+                )
+                if message_id is None:
+                    stream_state["use_interactive_card"] = False
+                    return
+                stream_state["message_id"] = message_id
+            else:
+                success = await self._update_interactive_message_async(
+                    stream_state["message_id"],
+                    stream_state["reasoning"],
+                    stream_state["content"] or "正在生成回复...",
+                    status="思考中",
+                    finished=False,
+                )
+                if not success:
+                    stream_state["use_interactive_card"] = False
+
+            stream_state["last_flush"] = now
+            stream_state["last_len"] = len(stream_state["content"])
+
+        try:
+            response = await self.agent.run_stream(
+                self.platform_name,
+                chat_id,
+                content,
+                model,
+                needs_thinking,
+                on_chunk=on_chunk,
+            )
+        except Exception as e:
+            logger.error(f"Error running stream response: {e}")
+            has_error_handled = False
+            if stream_state["message_id"] is not None:
+                updated = await self._update_interactive_message_async(
+                    stream_state["message_id"],
+                    stream_state["reasoning"],
+                    stream_state["content"] or "（生成失败，尝试重新发送）",
+                    status="生成失败",
+                    finished=True,
+                )
+                has_error_handled = has_error_handled or updated
+
+            if not has_error_handled:
+                await self._send_message_async(
+                    chat_id,
+                    "飞书流式生成出现异常，请稍后重试。",
+                )
+            return None
+
+        if stream_state["message_id"] is not None:
+            updated = await self._update_interactive_message_async(
+                stream_state["message_id"],
+                response.reasoning or stream_state["reasoning"],
+                response.content or stream_state["content"],
+                status="生成完成",
+                finished=True,
+            )
+            if not updated:
+                await self._send_agent_response(
+                    chat_id,
+                    response,
+                )
+            return response
+
+        if response:
+            await self._send_agent_response(chat_id, response)
+        return response
 
     def start(self):
         logger.info("Starting WebSocket connection...")
@@ -313,6 +492,202 @@ class FeishuAdapter(BaseAdapter):
                 )
         except Exception as e:
             logger.error(f"Error sending message: {e}")
+
+    def _truncate_card_text(self, text: str, max_len: int | None = None) -> str:
+        limit = max_len or self._stream_card_max_chars
+        if not text:
+            return ""
+        if len(text) <= limit:
+            return text
+        return text[: limit - 20] + "\n...（已截断）"
+
+    def _build_interactive_card_content(
+        self,
+        reasoning: str,
+        content: str,
+        status: str,
+        finished: bool,
+        include_header: bool = True,
+    ) -> str:
+        safe_reasoning = self._truncate_card_text(reasoning)
+        safe_content = self._truncate_card_text(content)
+
+        sections = [
+            f"**{status}**  |  {'已完成' if finished else '进行中'}",
+            "",
+        ]
+
+        if safe_reasoning:
+            sections.extend(["### 思考过程", safe_reasoning, ""])
+
+        sections.extend(["### 回复内容", safe_content or "（正在生成...）"])
+
+        card_text = "\n".join(sections)
+
+        card = {
+            "schema": "2.0",
+            "config": {
+                "wide_screen_mode": True,
+            },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": card_text,
+                    }
+                ]
+            },
+        }
+
+        if include_header:
+            card["header"] = {
+                "title": {
+                    "tag": "plain_text",
+                    "content": "飞书助手",
+                },
+                "template": "blue",
+            }
+
+        return json.dumps(card, ensure_ascii=False)
+
+    def _interactive_card_payloads(
+        self,
+        reasoning: str,
+        content: str,
+        status: str,
+        finished: bool,
+    ) -> list[str]:
+        return [
+            self._build_interactive_card_content(
+                reasoning,
+                content,
+                status,
+                finished,
+                include_header=True,
+            ),
+            self._build_interactive_card_content(
+                reasoning,
+                content,
+                status,
+                finished,
+                include_header=False,
+            ),
+        ]
+
+    def _extract_message_id(self, response) -> str | None:
+        if not response:
+            return None
+
+        data = getattr(response, "data", None)
+        if isinstance(data, dict):
+            return data.get("message_id") or data.get("messageId")
+
+        if data is not None:
+            return getattr(data, "message_id", None) or getattr(data, "messageId", None)
+
+        return None
+
+    async def _send_interactive_message_async(
+        self,
+        chat_id: str,
+        reasoning: str,
+        content: str,
+        status: str,
+        finished: bool,
+    ) -> str | None:
+        last_response = None
+        for idx, payload in enumerate(
+            self._interactive_card_payloads(reasoning, content, status, finished),
+            start=1,
+        ):
+            request = (
+                CreateMessageRequest.builder()
+                .receive_id_type("chat_id")
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type("interactive")
+                    .content(payload)
+                    .build()
+                )
+                .build()
+            )
+
+            response = await asyncio.to_thread(
+                self.api_client.im.v1.message.create, request
+            )
+            if response.success():
+                if idx > 1:
+                    logger.info(
+                        "Interactive card send fallback succeeded with simpler payload"
+                    )
+                return self._extract_message_id(response)
+            last_response = response
+
+        logger.error(
+            f"Failed to send interactive message: code={getattr(last_response, 'code', None)}, "
+            f"msg={getattr(last_response, 'msg', None)}, log_id={getattr(last_response, 'get_log_id', lambda: None)() if last_response else None}"
+        )
+        return None
+
+    async def _update_interactive_message_async(
+        self,
+        message_id: str,
+        reasoning: str,
+        content: str,
+        status: str,
+        finished: bool,
+    ) -> bool:
+        last_update_response = None
+        last_patch_response = None
+        for payload in self._interactive_card_payloads(
+            reasoning,
+            content,
+            status,
+            finished,
+        ):
+            update_request = (
+                UpdateMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(
+                    UpdateMessageRequestBodyBuilder()
+                    .msg_type("interactive")
+                    .content(payload)
+                    .build()
+                )
+                .build()
+            )
+
+            response = await asyncio.to_thread(
+                self.api_client.im.v1.message.update, update_request
+            )
+            last_update_response = response
+            if response.success():
+                return True
+
+            patch_request = (
+                PatchMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(PatchMessageRequestBodyBuilder().content(payload).build())
+                .build()
+            )
+
+            patch_response = await asyncio.to_thread(
+                self.api_client.im.v1.message.patch, patch_request
+            )
+            last_patch_response = patch_response
+
+            if patch_response.success():
+                return True
+
+        logger.error(
+            "Failed to update interactive message: "
+            f"update_code={getattr(last_update_response, 'code', None)}, "
+            f"update_msg={getattr(last_update_response, 'msg', None)}, "
+            f"patch_code={getattr(last_patch_response, 'code', None)}, "
+            f"patch_msg={getattr(last_patch_response, 'msg', None)}"
+        )
+        return False
 
     async def send_to_owner(self, text: str):
         chat_id = get_owner_chat_id()
