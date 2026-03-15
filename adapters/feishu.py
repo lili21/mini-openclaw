@@ -104,6 +104,12 @@ class FeishuAdapter(BaseAdapter):
         self._stream_flush_chars = self._get_int_env(
             "FEISHU_STREAM_OUTPUT_FLUSH_CHARS", 100
         )
+        self._stream_flush_each_chunk = self._get_bool_env(
+            "FEISHU_STREAM_OUTPUT_FLUSH_EACH_CHUNK", False
+        )
+        self._stream_include_reasoning = self._get_bool_env(
+            "FEISHU_STREAM_OUTPUT_INCLUDE_REASONING", False
+        )
         self._stream_card_max_chars = 3200
 
         self.api_client = (
@@ -351,7 +357,101 @@ class FeishuAdapter(BaseAdapter):
             "last_flush": 0.0,
             "last_len": 0,
             "use_interactive_card": True,
+            "flush_running": False,
+            "flush_pending": False,
+            "flush_task": None,
         }
+        flush_lock = asyncio.Lock()
+
+        def _current_payload_length() -> int:
+            length = len(stream_state["content"])
+            if self._stream_include_reasoning:
+                length += len(stream_state["reasoning"])
+            return length
+
+        def _should_flush() -> bool:
+            now = time.time()
+            if stream_state["message_id"] is None:
+                return True
+            if self._stream_flush_each_chunk:
+                return True
+            if now - stream_state["last_flush"] >= self._stream_interval_seconds:
+                return True
+            if (
+                _current_payload_length() - stream_state["last_len"]
+                >= self._stream_flush_chars
+            ):
+                return True
+            return False
+
+        async def _flush_interactive_message() -> bool:
+            if not stream_state["use_interactive_card"]:
+                return False
+
+            if stream_state["message_id"] is None:
+                message_id = await self._send_interactive_message_async(
+                    chat_id,
+                    stream_state["reasoning"],
+                    stream_state["content"] or "正在生成回复...",
+                    status="思考中",
+                    finished=False,
+                    include_reasoning=self._stream_include_reasoning,
+                )
+                if message_id is None:
+                    stream_state["use_interactive_card"] = False
+                    return False
+                stream_state["message_id"] = message_id
+            else:
+                success = await self._update_interactive_message_async(
+                    stream_state["message_id"],
+                    stream_state["reasoning"],
+                    stream_state["content"] or "正在生成回复...",
+                    status="思考中",
+                    finished=False,
+                    include_reasoning=self._stream_include_reasoning,
+                )
+                if not success:
+                    stream_state["use_interactive_card"] = False
+                    return False
+
+            stream_state["last_flush"] = time.time()
+            stream_state["last_len"] = _current_payload_length()
+            return True
+
+        async def _flush_worker() -> None:
+            try:
+                while (
+                    stream_state["flush_pending"]
+                    and stream_state["use_interactive_card"]
+                ):
+                    stream_state["flush_pending"] = False
+
+                    async with flush_lock:
+                        if not stream_state["use_interactive_card"]:
+                            return
+                        flushed = await _flush_interactive_message()
+                        if not flushed:
+                            return
+                        if not stream_state["flush_pending"]:
+                            return
+            except Exception as e:
+                logger.error(f"Error flushing interactive stream card: {e}")
+                stream_state["use_interactive_card"] = False
+
+            finally:
+                stream_state["flush_running"] = False
+                stream_state["flush_task"] = None
+
+        def _request_flush():
+            if not stream_state["use_interactive_card"]:
+                return
+
+            stream_state["flush_pending"] = True
+            if stream_state["flush_running"]:
+                return
+
+            stream_state["flush_running"] = True
+            stream_state["flush_task"] = asyncio.create_task(_flush_worker())
 
         async def on_chunk(content_delta: str, reasoning_delta: str):
             if not content_delta and not reasoning_delta:
@@ -366,46 +466,10 @@ class FeishuAdapter(BaseAdapter):
             if content_delta:
                 stream_state["content"] += content_delta
 
-            now = time.time()
-            should_flush = False
-            if stream_state["message_id"] is None:
-                should_flush = True
-            elif now - stream_state["last_flush"] >= self._stream_interval_seconds:
-                should_flush = True
-            elif (
-                len(stream_state["content"]) - stream_state["last_len"]
-                >= self._stream_flush_chars
-            ):
-                should_flush = True
-
-            if not should_flush:
+            if not _should_flush():
                 return
 
-            if stream_state["message_id"] is None:
-                message_id = await self._send_interactive_message_async(
-                    chat_id,
-                    stream_state["reasoning"],
-                    stream_state["content"] or "正在生成回复...",
-                    status="思考中",
-                    finished=False,
-                )
-                if message_id is None:
-                    stream_state["use_interactive_card"] = False
-                    return
-                stream_state["message_id"] = message_id
-            else:
-                success = await self._update_interactive_message_async(
-                    stream_state["message_id"],
-                    stream_state["reasoning"],
-                    stream_state["content"] or "正在生成回复...",
-                    status="思考中",
-                    finished=False,
-                )
-                if not success:
-                    stream_state["use_interactive_card"] = False
-
-            stream_state["last_flush"] = now
-            stream_state["last_len"] = len(stream_state["content"])
+            _request_flush()
 
         try:
             response = await self.agent.run_stream(
@@ -419,13 +483,17 @@ class FeishuAdapter(BaseAdapter):
         except Exception as e:
             logger.error(f"Error running stream response: {e}")
             has_error_handled = False
-            if stream_state["message_id"] is not None:
+            if (
+                stream_state["use_interactive_card"]
+                and stream_state["message_id"] is not None
+            ):
                 updated = await self._update_interactive_message_async(
                     stream_state["message_id"],
                     stream_state["reasoning"],
                     stream_state["content"] or "（生成失败，尝试重新发送）",
                     status="生成失败",
                     finished=True,
+                    include_reasoning=self._stream_include_reasoning,
                 )
                 has_error_handled = has_error_handled or updated
 
@@ -436,13 +504,21 @@ class FeishuAdapter(BaseAdapter):
                 )
             return None
 
-        if stream_state["message_id"] is not None:
+        if (
+            stream_state["use_interactive_card"]
+            and stream_state["message_id"] is not None
+        ):
+            if stream_state["flush_task"] is not None:
+                stream_state["flush_pending"] = True
+                await stream_state["flush_task"]
+
             updated = await self._update_interactive_message_async(
                 stream_state["message_id"],
                 response.reasoning or stream_state["reasoning"],
                 response.content or stream_state["content"],
                 status="生成完成",
                 finished=True,
+                include_reasoning=self._stream_include_reasoning,
             )
             if not updated:
                 await self._send_agent_response(
@@ -508,6 +584,7 @@ class FeishuAdapter(BaseAdapter):
         status: str,
         finished: bool,
         include_header: bool = True,
+        include_reasoning: bool = False,
     ) -> str:
         safe_reasoning = self._truncate_card_text(reasoning)
         safe_content = self._truncate_card_text(content)
@@ -517,7 +594,7 @@ class FeishuAdapter(BaseAdapter):
             "",
         ]
 
-        if safe_reasoning:
+        if include_reasoning and safe_reasoning:
             sections.extend(["### 思考过程", safe_reasoning, ""])
 
         sections.extend(["### 回复内容", safe_content or "（正在生成...）"])
@@ -556,6 +633,7 @@ class FeishuAdapter(BaseAdapter):
         content: str,
         status: str,
         finished: bool,
+        include_reasoning: bool,
     ) -> list[str]:
         return [
             self._build_interactive_card_content(
@@ -564,6 +642,7 @@ class FeishuAdapter(BaseAdapter):
                 status,
                 finished,
                 include_header=True,
+                include_reasoning=include_reasoning,
             ),
             self._build_interactive_card_content(
                 reasoning,
@@ -571,6 +650,7 @@ class FeishuAdapter(BaseAdapter):
                 status,
                 finished,
                 include_header=False,
+                include_reasoning=include_reasoning,
             ),
         ]
 
@@ -594,10 +674,17 @@ class FeishuAdapter(BaseAdapter):
         content: str,
         status: str,
         finished: bool,
+        include_reasoning: bool,
     ) -> str | None:
         last_response = None
         for idx, payload in enumerate(
-            self._interactive_card_payloads(reasoning, content, status, finished),
+            self._interactive_card_payloads(
+                reasoning,
+                content,
+                status,
+                finished,
+                include_reasoning=include_reasoning,
+            ),
             start=1,
         ):
             request = (
@@ -637,6 +724,7 @@ class FeishuAdapter(BaseAdapter):
         content: str,
         status: str,
         finished: bool,
+        include_reasoning: bool,
     ) -> bool:
         last_update_response = None
         last_patch_response = None
@@ -645,6 +733,7 @@ class FeishuAdapter(BaseAdapter):
             content,
             status,
             finished,
+            include_reasoning=include_reasoning,
         ):
             update_request = (
                 UpdateMessageRequest.builder()
