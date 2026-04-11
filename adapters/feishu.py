@@ -631,7 +631,7 @@ class FeishuAdapter(BaseAdapter):
             card["header"] = {
                 "title": {
                     "tag": "plain_text",
-                    "content": "飞书助手",
+                    "content": "猪猪",
                 },
                 "template": "blue",
             }

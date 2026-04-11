@@ -86,11 +86,11 @@ for name, adapter in adapters:
         adapter.set_event_loop(event_loop)
         logger.info(f"Set event loop for {name} adapter")
 
-for name, adapter in adapters:
-    logger.info(f"Starting scheduler for {name}...")
-    scheduler = Scheduler(adapter, agent)
-    schedulers.append(scheduler)
-    scheduler.start()
+# for name, adapter in adapters:
+#     logger.info(f"Starting scheduler for {name}...")
+#     scheduler = Scheduler(adapter, agent)
+#     schedulers.append(scheduler)
+#     scheduler.start()
 
 for name, adapter in adapters:
     logger.info(f"Starting {name} adapter...")
